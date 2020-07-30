@@ -1,18 +1,22 @@
 sudo: required
 dist: trusty
 
+git:
+  depth: false
+
 services:
   - docker
 
 env:
   global:
-    - REPO: $TRAVIS_REPO_SLUG
-    - VERSION: $TRAVIS_TAG
-    - CODENAME: roquefort
-    - N_MAKE_JOBS: 2
+    - REPO=$TRAVIS_REPO_SLUG
+    - VERSION=$TRAVIS_TAG
+    - CODENAME=picodon
+    - GO111MODULE=on
 
 script:
 - echo "Skipping tests... (Tests are executed on SemaphoreCI)"
+- if [ "$TRAVIS_PULL_REQUEST" != "false" ]; then make docs; fi
 
 before_deploy:
   - >
@@ -21,21 +25,15 @@ before_deploy:
       sudo -E apt-get -yq update;
       sudo -E apt-get -yq --no-install-suggests --no-install-recommends --force-yes install docker-ce=${DOCKER_VERSION}*;
       docker version;
-      pip install --user -r requirements.txt;
-      make -j${N_MAKE_JOBS} crossbinary-parallel;
-      make image-dirty;
-      mkdocs build --clean;
-      tar cfz dist/traefik-${VERSION}.src.tar.gz --exclude-vcs --exclude dist .;
+      make build-image;
+      if [ "$TRAVIS_TAG" ]; then
+        make release-packages;
+      fi;
+      curl -sfL https://raw.githubusercontent.com/containous/structor/master/godownloader.sh | bash -s -- -b "${GOPATH}/bin" ${STRUCTOR_VERSION}
+      structor -o containous -r traefik --dockerfile-url="https://raw.githubusercontent.com/containous/traefik/v1.7/docs.Dockerfile" --menu.js-url="https://raw.githubusercontent.com/containous/structor/master/traefik-menu.js.gotmpl" --rqts-url="https://raw.githubusercontent.com/containous/structor/master/requirements-override.txt" --force-edit-url --exp-branch=master --debug;
     fi
+
 deploy:
-  - provider: pages
-    edge: true
-    github_token: ${GITHUB_TOKEN}
-    local_dir: site
-    skip_cleanup: true
-    on:
-      repo: containous/traefik
-      tags: true
   - provider: releases
     api_key: ${GITHUB_TOKEN}
     file: dist/traefik*
@@ -50,8 +48,11 @@ deploy:
     on:
       repo: containous/traefik
       tags: true
-  - provider: script
-    script: sh script/deploy-docker.sh
+  - provider: pages
+    edge: false
+    github_token: ${GITHUB_TOKEN}
+    local_dir: site
     skip_cleanup: true
     on:
       repo: containous/traefik
+      all_branches: true

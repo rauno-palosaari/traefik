@@ -6,12 +6,12 @@ import (
 	"os"
 	"time"
 
-	"github.com/containous/traefik/integration/try"
+	"github.com/containous/traefik/v2/integration/try"
 	"github.com/go-check/check"
 	checker "github.com/vdemeester/shakers"
 )
 
-// HealthCheck test suites (using libcompose)
+// HealthCheck test suites (using libcompose).
 type HealthCheckSuite struct {
 	BaseSuite
 	whoami1IP string
@@ -27,20 +27,20 @@ func (s *HealthCheckSuite) SetUpSuite(c *check.C) {
 }
 
 func (s *HealthCheckSuite) TestSimpleConfiguration(c *check.C) {
-
 	file := s.adaptFile(c, "fixtures/healthcheck/simple.toml", struct {
 		Server1 string
 		Server2 string
 	}{s.whoami1IP, s.whoami2IP})
 	defer os.Remove(file)
 
-	cmd, _ := s.cmdTraefik(withConfigFile(file))
+	cmd, display := s.traefikCmd(withConfigFile(file))
+	defer display(c)
 	err := cmd.Start()
 	c.Assert(err, checker.IsNil)
 	defer cmd.Process.Kill()
 
 	// wait for traefik
-	err = try.GetRequest("http://127.0.0.1:8080/api/providers", 60*time.Second, try.BodyContains("Host:test.localhost"))
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 60*time.Second, try.BodyContains("Host(`test.localhost`)"))
 	c.Assert(err, checker.IsNil)
 
 	frontendHealthReq, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/health", nil)
@@ -59,9 +59,6 @@ func (s *HealthCheckSuite) TestSimpleConfiguration(c *check.C) {
 		_, err = client.Do(statusInternalServerErrorReq)
 		c.Assert(err, checker.IsNil)
 	}
-
-	// Waiting for Traefik healthcheck
-	try.Sleep(2 * time.Second)
 
 	// Verify no backend service is available due to failing health checks
 	err = try.Request(frontendHealthReq, 3*time.Second, try.StatusCodeIs(http.StatusServiceUnavailable))
@@ -97,28 +94,21 @@ func (s *HealthCheckSuite) TestSimpleConfiguration(c *check.C) {
 	c.Assert(resp.StatusCode, checker.Equals, http.StatusNotFound)
 }
 
-func (s *HealthCheckSuite) TestMultipleEntrypointsWrr(c *check.C) {
-	s.doTestMultipleEntrypoints(c, "fixtures/healthcheck/multiple-entrypoints-wrr.toml")
-}
-
-func (s *HealthCheckSuite) TestMultipleEntrypointsDrr(c *check.C) {
-	s.doTestMultipleEntrypoints(c, "fixtures/healthcheck/multiple-entrypoints-drr.toml")
-}
-
-func (s *HealthCheckSuite) doTestMultipleEntrypoints(c *check.C, fixture string) {
-	file := s.adaptFile(c, fixture, struct {
+func (s *HealthCheckSuite) TestMultipleEntrypoints(c *check.C) {
+	file := s.adaptFile(c, "fixtures/healthcheck/multiple-entrypoints.toml", struct {
 		Server1 string
 		Server2 string
 	}{s.whoami1IP, s.whoami2IP})
 	defer os.Remove(file)
 
-	cmd, _ := s.cmdTraefik(withConfigFile(file))
+	cmd, display := s.traefikCmd(withConfigFile(file))
+	defer display(c)
 	err := cmd.Start()
 	c.Assert(err, checker.IsNil)
 	defer cmd.Process.Kill()
 
 	// Wait for traefik
-	err = try.GetRequest("http://localhost:8080/api/providers", 60*time.Second, try.BodyContains("Host:test.localhost"))
+	err = try.GetRequest("http://localhost:8080/api/rawdata", 60*time.Second, try.BodyContains("Host(`test.localhost`)"))
 	c.Assert(err, checker.IsNil)
 
 	// Check entrypoint http1
@@ -137,15 +127,25 @@ func (s *HealthCheckSuite) doTestMultipleEntrypoints(c *check.C, fixture string)
 	err = try.Request(frontendHealthReq, 500*time.Millisecond, try.StatusCodeIs(http.StatusOK))
 	c.Assert(err, checker.IsNil)
 
-	// Set one whoami health to 500
+	// Set the both whoami health to 500
 	client := &http.Client{}
-	statusInternalServerErrorReq, err := http.NewRequest(http.MethodPost, "http://"+s.whoami1IP+"/health", bytes.NewBuffer([]byte("500")))
-	c.Assert(err, checker.IsNil)
-	_, err = client.Do(statusInternalServerErrorReq)
+	whoamiHosts := []string{s.whoami1IP, s.whoami2IP}
+	for _, whoami := range whoamiHosts {
+		statusInternalServerErrorReq, err := http.NewRequest(http.MethodPost, "http://"+whoami+"/health", bytes.NewBuffer([]byte("500")))
+		c.Assert(err, checker.IsNil)
+		_, err = client.Do(statusInternalServerErrorReq)
+		c.Assert(err, checker.IsNil)
+	}
+
+	// Verify no backend service is available due to failing health checks
+	err = try.Request(frontendHealthReq, 5*time.Second, try.StatusCodeIs(http.StatusServiceUnavailable))
 	c.Assert(err, checker.IsNil)
 
-	// Waiting for Traefik healthcheck
-	try.Sleep(2 * time.Second)
+	// reactivate the whoami2
+	statusInternalServerOkReq, err := http.NewRequest(http.MethodPost, "http://"+s.whoami2IP+"/health", bytes.NewBuffer([]byte("200")))
+	c.Assert(err, checker.IsNil)
+	_, err = client.Do(statusInternalServerOkReq)
+	c.Assert(err, checker.IsNil)
 
 	frontend1Req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/", nil)
 	c.Assert(err, checker.IsNil)
@@ -157,9 +157,117 @@ func (s *HealthCheckSuite) doTestMultipleEntrypoints(c *check.C, fixture string)
 
 	// Check if whoami1 never responds
 	err = try.Request(frontend2Req, 2*time.Second, try.BodyContains(s.whoami1IP))
-	c.Assert(err, checker.Not(checker.IsNil))
+	c.Assert(err, checker.NotNil)
 
 	// Check if whoami1 never responds
 	err = try.Request(frontend1Req, 2*time.Second, try.BodyContains(s.whoami1IP))
-	c.Assert(err, checker.Not(checker.IsNil))
+	c.Assert(err, checker.NotNil)
+}
+
+func (s *HealthCheckSuite) TestPortOverload(c *check.C) {
+	// Set one whoami health to 200
+	client := &http.Client{}
+	statusInternalServerErrorReq, err := http.NewRequest(http.MethodPost, "http://"+s.whoami1IP+"/health", bytes.NewBuffer([]byte("200")))
+	c.Assert(err, checker.IsNil)
+	_, err = client.Do(statusInternalServerErrorReq)
+	c.Assert(err, checker.IsNil)
+
+	file := s.adaptFile(c, "fixtures/healthcheck/port_overload.toml", struct {
+		Server1 string
+	}{s.whoami1IP})
+	defer os.Remove(file)
+
+	cmd, display := s.traefikCmd(withConfigFile(file))
+	defer display(c)
+	err = cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	// wait for traefik
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 10*time.Second, try.BodyContains("Host(`test.localhost`)"))
+	c.Assert(err, checker.IsNil)
+
+	frontendHealthReq, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/health", nil)
+	c.Assert(err, checker.IsNil)
+	frontendHealthReq.Host = "test.localhost"
+
+	// We test bad gateway because we use an invalid port for the backend
+	err = try.Request(frontendHealthReq, 500*time.Millisecond, try.StatusCodeIs(http.StatusBadGateway))
+	c.Assert(err, checker.IsNil)
+
+	// Set one whoami health to 500
+	statusInternalServerErrorReq, err = http.NewRequest(http.MethodPost, "http://"+s.whoami1IP+"/health", bytes.NewBuffer([]byte("500")))
+	c.Assert(err, checker.IsNil)
+	_, err = client.Do(statusInternalServerErrorReq)
+	c.Assert(err, checker.IsNil)
+
+	// Verify no backend service is available due to failing health checks
+	err = try.Request(frontendHealthReq, 3*time.Second, try.StatusCodeIs(http.StatusServiceUnavailable))
+	c.Assert(err, checker.IsNil)
+}
+
+// Checks if all the loadbalancers created will correctly update the server status.
+func (s *HealthCheckSuite) TestMultipleRoutersOnSameService(c *check.C) {
+	file := s.adaptFile(c, "fixtures/healthcheck/multiple-routers-one-same-service.toml", struct {
+		Server1 string
+	}{s.whoami1IP})
+	defer os.Remove(file)
+
+	cmd, display := s.traefikCmd(withConfigFile(file))
+	defer display(c)
+	err := cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	// wait for traefik
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 60*time.Second, try.BodyContains("Host(`test.localhost`)"))
+	c.Assert(err, checker.IsNil)
+
+	// Set whoami health to 200 to be sure to start with the wanted status
+	client := &http.Client{}
+	statusOkReq, err := http.NewRequest(http.MethodPost, "http://"+s.whoami1IP+"/health", bytes.NewBuffer([]byte("200")))
+	c.Assert(err, checker.IsNil)
+	_, err = client.Do(statusOkReq)
+	c.Assert(err, checker.IsNil)
+
+	// check healthcheck on web1 entrypoint
+	healthReqWeb1, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/health", nil)
+	c.Assert(err, checker.IsNil)
+	healthReqWeb1.Host = "test.localhost"
+	err = try.Request(healthReqWeb1, 1*time.Second, try.StatusCodeIs(http.StatusOK))
+	c.Assert(err, checker.IsNil)
+
+	// check healthcheck on web2 entrypoint
+	healthReqWeb2, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:9000/health", nil)
+	c.Assert(err, checker.IsNil)
+	healthReqWeb2.Host = "test.localhost"
+
+	err = try.Request(healthReqWeb2, 500*time.Millisecond, try.StatusCodeIs(http.StatusOK))
+	c.Assert(err, checker.IsNil)
+
+	// Set whoami health to 500
+	statusInternalServerErrorReq, err := http.NewRequest(http.MethodPost, "http://"+s.whoami1IP+"/health", bytes.NewBuffer([]byte("500")))
+	c.Assert(err, checker.IsNil)
+	_, err = client.Do(statusInternalServerErrorReq)
+	c.Assert(err, checker.IsNil)
+
+	// Verify no backend service is available due to failing health checks
+	err = try.Request(healthReqWeb1, 3*time.Second, try.StatusCodeIs(http.StatusServiceUnavailable))
+	c.Assert(err, checker.IsNil)
+
+	err = try.Request(healthReqWeb2, 3*time.Second, try.StatusCodeIs(http.StatusServiceUnavailable))
+	c.Assert(err, checker.IsNil)
+
+	// Change one whoami health to 200
+	statusOKReq1, err := http.NewRequest(http.MethodPost, "http://"+s.whoami1IP+"/health", bytes.NewBuffer([]byte("200")))
+	c.Assert(err, checker.IsNil)
+	_, err = client.Do(statusOKReq1)
+	c.Assert(err, checker.IsNil)
+
+	// Verify health check
+	err = try.Request(healthReqWeb1, 3*time.Second, try.StatusCodeIs(http.StatusOK))
+	c.Assert(err, checker.IsNil)
+
+	err = try.Request(healthReqWeb2, 3*time.Second, try.StatusCodeIs(http.StatusOK))
+	c.Assert(err, checker.IsNil)
 }

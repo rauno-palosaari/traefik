@@ -6,9 +6,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/containous/traefik/integration/try"
-	"github.com/containous/traefik/types"
-	marathon "github.com/gambol99/go-marathon"
+	"github.com/containous/traefik/v2/integration/try"
+	"github.com/gambol99/go-marathon"
 	"github.com/go-check/check"
 	checker "github.com/vdemeester/shakers"
 )
@@ -18,7 +17,7 @@ const (
 	containerNameMarathon   = "marathon"
 )
 
-// Marathon test suites (using libcompose)
+// Marathon test suites (using libcompose).
 type MarathonSuite struct {
 	BaseSuite
 	marathonURL string
@@ -61,7 +60,7 @@ func (s *MarathonSuite) extendDockerHostsFile(host, ipAddr string) error {
 	// (See also https://groups.google.com/d/topic/docker-user/JOGE7AnJ3Gw/discussion.)
 	if os.Getenv("CONTAINER") == "DOCKER" {
 		// We are running inside a container -- extend the hosts file.
-		file, err := os.OpenFile(hostsFile, os.O_APPEND|os.O_WRONLY, 0600)
+		file, err := os.OpenFile(hostsFile, os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
 			return err
 		}
@@ -88,7 +87,8 @@ func (s *MarathonSuite) TestConfigurationUpdate(c *check.C) {
 		MarathonURL string
 	}{s.marathonURL})
 	defer os.Remove(file)
-	cmd, output := s.cmdTraefik(withConfigFile(file))
+	cmd, display := s.traefikCmd(withConfigFile(file))
+	defer display(c)
 	err := cmd.Start()
 	c.Assert(err, checker.IsNil)
 	defer cmd.Process.Kill()
@@ -103,25 +103,15 @@ func (s *MarathonSuite) TestConfigurationUpdate(c *check.C) {
 	client, err := marathon.NewClient(config)
 	c.Assert(err, checker.IsNil)
 
-	// Show the Traefik log if any assertion fails. If the entire test runs
-	// to a successful completion, we flip the flag at the very end and don't
-	// display anything.
-	showTraefikLog := true
-	defer func() {
-		if showTraefikLog {
-			s.displayTraefikLog(c, output)
-		}
-	}()
-
 	// Create test application to be deployed.
 	app := marathon.NewDockerApplication().
 		Name("/whoami").
 		CPU(0.1).
 		Memory(32).
-		AddLabel(types.LabelFrontendRule, "PathPrefix:/service")
+		AddLabel("traefik.http.Routers.rt.Rule", "PathPrefix(`/service`)")
 	app.Container.Docker.Bridged().
 		Expose(80).
-		Container("emilevauge/whoami")
+		Container("containous/whoami")
 
 	// Deploy the test application.
 	deployApplication(c, client, app)
@@ -135,10 +125,10 @@ func (s *MarathonSuite) TestConfigurationUpdate(c *check.C) {
 		Name("/whoami").
 		CPU(0.1).
 		Memory(32).
-		AddLabel(types.ServiceLabel(types.LabelFrontendRule, "app"), "PathPrefix:/app")
+		AddLabel("traefik.http.Routers.app.Rule", "PathPrefix(`/app`)")
 	app.Container.Docker.Bridged().
 		Expose(80).
-		Container("emilevauge/whoami")
+		Container("containous/whoami")
 
 	// Deploy the test application.
 	deployApplication(c, client, app)
@@ -146,6 +136,4 @@ func (s *MarathonSuite) TestConfigurationUpdate(c *check.C) {
 	// Query application via Traefik.
 	err = try.GetRequest("http://127.0.0.1:8000/app", 30*time.Second, try.StatusCodeIs(http.StatusOK))
 	c.Assert(err, checker.IsNil)
-
-	showTraefikLog = false
 }

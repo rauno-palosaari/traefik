@@ -1,23 +1,37 @@
 <!--
 PLEASE READ THIS MESSAGE.
 
-HOW TO WRITE A GOOD PULL REQUEST?
+Documentation fixes or enhancements:
+- for Traefik v1: use branch v1.7
+- for Traefik v2: use branch v2.2
 
-- Make it small.
-- Do only one thing.
-- Avoid re-formatting.
-- Make sure the code builds.
-- Make sure all tests pass.
-- Add tests.
-- Write useful descriptions and titles.
-- Address review comments in terms of additional commits.
-- Do not amend/squash existing ones unless the PR is trivial.
-- Read the contributing guide: https://github.com/containous/traefik/blob/master/.github/CONTRIBUTING.md.
+Bug fixes:
+- for Traefik v1: use branch v1.7
+- for Traefik v2: use branch v2.2
+
+Enhancements:
+- for Traefik v1: we only accept bug fixes
+- for Traefik v2: use branch master
+
+HOW TO WRITE A GOOD PULL REQUEST? https://docs.traefik.io/contributing/submitting-pull-requests/
 
 -->
 
-### Description
+### What does this PR do?
 
-<!--
-Briefly describe the pull request in a few paragraphs.
--->
+<!-- A brief description of the change being made with this pull request. -->
+
+
+### Motivation
+
+<!-- What inspired you to submit this pull request? -->
+
+
+### More
+
+- [ ] Added/updated tests
+- [ ] Added/updated documentation
+
+### Additional Notes
+
+<!-- Anything else we should know when reviewing? -->
