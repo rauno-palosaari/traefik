@@ -1,79 +1,76 @@
-# Træfik Web UI
+# Traefik Web UI
 
-Access to Træfik Web UI, ex: http://localhost:8080
+Access to Traefik Web UI, ex: http://localhost:8080
 
 ## Interface
 
-Træfik Web UI provide 2 types of informations:
+Traefik Web UI provide 2 types of information:
+
 - Providers with their backends and frontends information.
 - Health of the web server.
 
-## How to build (for backends developer)
+## How to build (for backend developer)
 
-Use the make file :
+Use the Makefile :
 
 ```shell
-make build           # Generate Docker image
-make generate-webui  # Generate static contents in `traefik/static/` folder.
+make build-image                # Generate Docker image.
+make clean-webui generate-webui # Generate static contents in `webui/static/` folder.
 ```
 
-## How to build (only for frontends developer)
+## How to build (only for frontend developer)
 
-- prerequisite: [Node 4+](https://nodejs.org) [yarn](https://yarnpkg.com/)
+- prerequisite: [Node 26](https://nodejs.org) [Yarn](https://yarnpkg.com/)
 
-  Note: In case of conflict with the Apache Hadoop Yarn Command Line Interface, use the `yarnpkg`
-  alias.
+- Go to the `webui/` directory
 
-- Go to the directory `webui`
+- As we use Yarn v4, you will need to install corepack before installing dependencies:
+
+  - `npm i -g corepack@0.36.0 --ignore-scripts`
 
 - To install dependencies, execute the following commands:
+
   - `yarn install`
 
 - Build static Web UI, execute the following command:
-  - `yarn run build`
 
-- Static contents are build in the directory `static`
+  - `yarn build`
 
-**Don't change manually the files in the directory `static`**
+- Static contents are built in the `webui/static/` directory
 
-- The build allow to:
+**Do not manually change the files in the `webui/static/` directory**
+
+The build allows to:
   - optimize all JavaScript
   - optimize all CSS
-  - add vendor prefixes to CSS (cross-bowser support)
+  - add vendor prefixes to CSS (cross-browser support)
   - add a hash in the file names to prevent browser cache problems
-  - all images will be optimized at build
+  - optimize all images at build time
   - bundle JavaScript in one file
 
+## How to edit (only for frontend developer)
 
-## How to edit (only for frontends developer)
+**Do not manually change the files in the `webui/static/` directory**
 
-**Don't change manually the files in the directory `static`**
-
-- Go to the directory `webui`
-- Edit files in `webui/src`
-
+- Go to the `webui/` directory
+- Edit files in `webui/src/`
+- Create and populate the `.env` file using the values inside `.env.sample` file.
 - Run in development mode :
-  - `yarn run serve`
+  - `yarn dev`
+- The application will be available at `http://localhost:3000/`. On development mode, the application will run with mocked data served by [Mock Service Worker](https://mswjs.io/).
 
-- Træfik API connections are defined in:
-  - `webui/src/app/core/health.resource.js`
-  - `webui/src/app/core/providers.resource.js`
+## How to run tests
 
-- The pages contents are in the directory `webui/src/app/sections`.
-
+- Execute the following commands:
+  - `yarn test`
+  - or `yarn test:watch` if you want them in watch mode
 
 ## Libraries
 
 - [Node](https://nodejs.org)
 - [Yarn](https://yarnpkg.com/)
-- [Generator FountainJS](https://github.com/FountainJS/generator-fountain-webapp)
-- [Webpack](https://github.com/webpack/webpack)
-- [AngularJS](https://docs.angularjs.org/api)
-- [UI Router](https://github.com/angular-ui/ui-router)
-  - [UI Router - Documentation](https://github.com/angular-ui/ui-router/wiki)
-- [Bootstrap](http://getbootstrap.com)
-- [Angular Bootstrap](https://angular-ui.github.io/bootstrap)
-- [D3](http://d3js.org)
-  - [D3 - Documentation](https://github.com/mbostock/d3/wiki)
-- [NVD3](http://nvd3.org)
-- [Angular nvD3](http://krispo.github.io/angular-nvd3)
+- [React](https://reactjs.org/)
+- [Vite](https://vitejs.dev/)
+- [Faency](https://github.com/containous/faency)
+- [Vitest](https://vitest.dev/)
+- [Mock Service Worker](https://mswjs.io/)

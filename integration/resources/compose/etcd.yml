@@ -1,14 +1,9 @@
-etcd:
-  image: containous/docker-etcd
-  
-whoami1:
-  image: emilevauge/whoami
-  
-whoami2:
-  image: emilevauge/whoami
-  
-whoami3:
-  image: emilevauge/whoami
-  
-whoami4:
-  image: emilevauge/whoami
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.14
+    command:
+      - etcd
+      - --listen-client-urls
+      - http://0.0.0.0:2379
+      - --advertise-client-urls
+      - http://0.0.0.0:2380

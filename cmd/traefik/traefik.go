@@ -1,368 +1,680 @@
 package main
 
 import (
-	"crypto/tls"
-	"encoding/json"
+	"context"
+	"crypto/x509"
 	"fmt"
-	fmtlog "log"
+	"io"
+	stdlog "log"
+	"maps"
 	"net/http"
 	"os"
-	"path/filepath"
-	"reflect"
-	"runtime"
+	"os/signal"
+	"slices"
 	"strings"
+	"syscall"
 	"time"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/containous/flaeg"
-	"github.com/containous/staert"
-	"github.com/containous/traefik/acme"
-	"github.com/containous/traefik/cluster"
-	"github.com/containous/traefik/configuration"
-	"github.com/containous/traefik/log"
-	"github.com/containous/traefik/provider/ecs"
-	"github.com/containous/traefik/provider/kubernetes"
-	"github.com/containous/traefik/provider/rancher"
-	"github.com/containous/traefik/safe"
-	"github.com/containous/traefik/server"
-	"github.com/containous/traefik/types"
-	"github.com/containous/traefik/version"
-	"github.com/coreos/go-systemd/daemon"
-	"github.com/docker/libkv/store"
-	"github.com/satori/go.uuid"
+	"github.com/coreos/go-systemd/v22/daemon"
+	"github.com/go-acme/lego/v5/challenge"
+	gokitmetrics "github.com/go-kit/kit/metrics"
+	"github.com/rs/zerolog/log"
+	"github.com/sirupsen/logrus"
+	"github.com/spiffe/go-spiffe/v2/workloadapi"
+	"github.com/traefik/paerser/cli"
+	"github.com/traefik/traefik/v3/cmd"
+	"github.com/traefik/traefik/v3/cmd/healthcheck"
+	cmdVersion "github.com/traefik/traefik/v3/cmd/version"
+	tcli "github.com/traefik/traefik/v3/pkg/cli"
+	"github.com/traefik/traefik/v3/pkg/collector"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/config/runtime"
+	"github.com/traefik/traefik/v3/pkg/config/static"
+	"github.com/traefik/traefik/v3/pkg/middlewares/accesslog"
+	"github.com/traefik/traefik/v3/pkg/observability/logs"
+	"github.com/traefik/traefik/v3/pkg/observability/metrics"
+	"github.com/traefik/traefik/v3/pkg/observability/tracing"
+	otypes "github.com/traefik/traefik/v3/pkg/observability/types"
+	"github.com/traefik/traefik/v3/pkg/provider/acme"
+	"github.com/traefik/traefik/v3/pkg/provider/aggregator"
+	"github.com/traefik/traefik/v3/pkg/provider/tailscale"
+	"github.com/traefik/traefik/v3/pkg/provider/traefik"
+	"github.com/traefik/traefik/v3/pkg/proxy"
+	"github.com/traefik/traefik/v3/pkg/proxy/httputil"
+	"github.com/traefik/traefik/v3/pkg/redactor"
+	"github.com/traefik/traefik/v3/pkg/safe"
+	"github.com/traefik/traefik/v3/pkg/server"
+	"github.com/traefik/traefik/v3/pkg/server/middleware"
+	"github.com/traefik/traefik/v3/pkg/server/service"
+	"github.com/traefik/traefik/v3/pkg/tcp"
+	traefiktls "github.com/traefik/traefik/v3/pkg/tls"
+	"github.com/traefik/traefik/v3/pkg/version"
 )
 
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
+	// traefik config inits
+	tConfig := cmd.NewTraefikConfiguration()
 
-	//traefik config inits
-	traefikConfiguration := NewTraefikConfiguration()
-	traefikPointersConfiguration := NewTraefikDefaultPointersConfiguration()
-	//traefik Command init
-	traefikCmd := &flaeg.Command{
+	loaders := []cli.ResourceLoader{&tcli.DeprecationLoader{}, &tcli.FileLoader{}, &tcli.FlagLoader{}, &tcli.EnvLoader{}}
+
+	cmdTraefik := &cli.Command{
 		Name: "traefik",
-		Description: `traefik is a modern HTTP reverse proxy and load balancer made to deploy microservices with ease.
+		Description: `Traefik is a modern HTTP reverse proxy and load balancer made to deploy microservices with ease.
 Complete documentation is available at https://traefik.io`,
-		Config:                traefikConfiguration,
-		DefaultPointersConfig: traefikPointersConfiguration,
-		Run: func() error {
-			globalConfiguration := traefikConfiguration.GlobalConfiguration
-			if globalConfiguration.File != nil && len(globalConfiguration.File.Filename) == 0 {
-				// no filename, setting to global config file
-				if len(traefikConfiguration.ConfigFile) != 0 {
-					globalConfiguration.File.Filename = traefikConfiguration.ConfigFile
-				} else {
-					log.Errorln("Error using file configuration backend, no filename defined")
-				}
-			}
-			if len(traefikConfiguration.ConfigFile) != 0 {
-				log.Infof("Using TOML configuration file %s", traefikConfiguration.ConfigFile)
-			}
-			run(&globalConfiguration)
-			return nil
+		Configuration: tConfig,
+		Resources:     loaders,
+		Run: func(_ []string) error {
+			return runCmd(&tConfig.Configuration)
 		},
 	}
 
-	//storeconfig Command init
-	var kv *staert.KvSource
-	var err error
-
-	storeConfigCmd := &flaeg.Command{
-		Name:                  "storeconfig",
-		Description:           `Store the static traefik configuration into a Key-value stores. Traefik will not start.`,
-		Config:                traefikConfiguration,
-		DefaultPointersConfig: traefikPointersConfiguration,
-		Run: func() error {
-			if kv == nil {
-				return fmt.Errorf("Error using command storeconfig, no Key-value store defined")
-			}
-			jsonConf, err := json.Marshal(traefikConfiguration.GlobalConfiguration)
-			if err != nil {
-				return err
-			}
-			fmtlog.Printf("Storing configuration: %s\n", jsonConf)
-			err = kv.StoreConfig(traefikConfiguration.GlobalConfiguration)
-			if err != nil {
-				return err
-			}
-			if traefikConfiguration.GlobalConfiguration.ACME != nil && len(traefikConfiguration.GlobalConfiguration.ACME.StorageFile) > 0 {
-				// convert ACME json file to KV store
-				localStore := acme.NewLocalStore(traefikConfiguration.GlobalConfiguration.ACME.StorageFile)
-				object, err := localStore.Load()
-				if err != nil {
-					return err
-				}
-				meta := cluster.NewMetadata(object)
-				err = meta.Marshall()
-				if err != nil {
-					return err
-				}
-				source := staert.KvSource{
-					Store:  kv,
-					Prefix: traefikConfiguration.GlobalConfiguration.ACME.Storage,
-				}
-				err = source.StoreConfig(meta)
-				if err != nil {
-					return err
-				}
-			}
-			return nil
-		},
-		Metadata: map[string]string{
-			"parseAllSources": "true",
-		},
-	}
-
-	healthCheckCmd := &flaeg.Command{
-		Name:                  "healthcheck",
-		Description:           `Calls traefik /ping to check health (web provider must be enabled)`,
-		Config:                traefikConfiguration,
-		DefaultPointersConfig: traefikPointersConfiguration,
-		Run: func() error {
-			if traefikConfiguration.Web == nil {
-				fmt.Println("Please enable the web provider to use healtcheck.")
-				os.Exit(1)
-			}
-			client := &http.Client{Timeout: 5 * time.Second}
-			protocol := "http"
-			if len(traefikConfiguration.Web.CertFile) > 0 {
-				protocol = "https"
-				tr := &http.Transport{
-					TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-				}
-				client.Transport = tr
-			}
-			resp, err := client.Head(protocol + "://" + traefikConfiguration.Web.Address + "/ping")
-			if err != nil {
-				fmt.Printf("Error calling healthcheck: %s\n", err)
-				os.Exit(1)
-			}
-			if resp.StatusCode != http.StatusOK {
-				fmt.Printf("Bad healthcheck status: %s\n", resp.Status)
-				os.Exit(1)
-			}
-			fmt.Printf("OK: %s\n", resp.Request.URL)
-			os.Exit(0)
-			return nil
-		},
-		Metadata: map[string]string{
-			"parseAllSources": "true",
-		},
-	}
-
-	//init flaeg source
-	f := flaeg.New(traefikCmd, os.Args[1:])
-	//add custom parsers
-	f.AddParser(reflect.TypeOf(configuration.EntryPoints{}), &configuration.EntryPoints{})
-	f.AddParser(reflect.TypeOf(configuration.DefaultEntryPoints{}), &configuration.DefaultEntryPoints{})
-	f.AddParser(reflect.TypeOf(configuration.RootCAs{}), &configuration.RootCAs{})
-	f.AddParser(reflect.TypeOf(types.Constraints{}), &types.Constraints{})
-	f.AddParser(reflect.TypeOf(kubernetes.Namespaces{}), &kubernetes.Namespaces{})
-	f.AddParser(reflect.TypeOf(ecs.Clusters{}), &ecs.Clusters{})
-	f.AddParser(reflect.TypeOf([]acme.Domain{}), &acme.Domains{})
-	f.AddParser(reflect.TypeOf(types.Buckets{}), &types.Buckets{})
-
-	//add commands
-	f.AddCommand(newVersionCmd())
-	f.AddCommand(newBugCmd(traefikConfiguration, traefikPointersConfiguration))
-	f.AddCommand(storeConfigCmd)
-	f.AddCommand(healthCheckCmd)
-
-	usedCmd, err := f.GetCommand()
+	err := cmdTraefik.AddCommand(healthcheck.NewCmd(&tConfig.Configuration, loaders))
 	if err != nil {
-		fmtlog.Println(err)
-		os.Exit(-1)
+		stdlog.Println(err)
+		os.Exit(1)
 	}
 
-	if _, err := f.Parse(usedCmd); err != nil {
-		fmtlog.Printf("Error parsing command: %s\n", err)
-		os.Exit(-1)
-	}
-
-	//staert init
-	s := staert.NewStaert(traefikCmd)
-	//init toml source
-	toml := staert.NewTomlSource("traefik", []string{traefikConfiguration.ConfigFile, "/etc/traefik/", "$HOME/.traefik/", "."})
-
-	//add sources to staert
-	s.AddSource(toml)
-	s.AddSource(f)
-	if _, err := s.LoadConfig(); err != nil {
-		fmtlog.Println(fmt.Errorf("Error reading TOML config file %s : %s", toml.ConfigFileUsed(), err))
-		os.Exit(-1)
-	}
-
-	traefikConfiguration.ConfigFile = toml.ConfigFileUsed()
-
-	kv, err = CreateKvSource(traefikConfiguration)
+	err = cmdTraefik.AddCommand(cmdVersion.NewCmd())
 	if err != nil {
-		fmtlog.Printf("Error creating kv store: %s\n", err)
-		os.Exit(-1)
+		stdlog.Println(err)
+		os.Exit(1)
 	}
 
-	// IF a KV Store is enable and no sub-command called in args
-	if kv != nil && usedCmd == traefikCmd {
-		if traefikConfiguration.Cluster == nil {
-			traefikConfiguration.Cluster = &types.Cluster{Node: uuid.NewV4().String()}
-		}
-		if traefikConfiguration.Cluster.Store == nil {
-			traefikConfiguration.Cluster.Store = &types.Store{Prefix: kv.Prefix, Store: kv.Store}
-		}
-		s.AddSource(kv)
-		if _, err := s.LoadConfig(); err != nil {
-			fmtlog.Printf("Error loading configuration: %s\n", err)
-			os.Exit(-1)
-		}
+	err = cli.Execute(cmdTraefik)
+	if err != nil {
+		log.Error().Err(err).Msg("Command error")
+		logrus.Exit(1)
 	}
 
-	if err := s.Run(); err != nil {
-		fmtlog.Printf("Error running traefik: %s\n", err)
-		os.Exit(-1)
-	}
-
-	os.Exit(0)
+	logrus.Exit(0)
 }
 
-func run(globalConfiguration *configuration.GlobalConfiguration) {
-	fmtlog.SetFlags(fmtlog.Lshortfile | fmtlog.LstdFlags)
+func runCmd(staticConfiguration *static.Configuration) error {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	if err := setupLogger(ctx, staticConfiguration); err != nil {
+		return fmt.Errorf("setting up logger: %w", err)
+	}
 
 	http.DefaultTransport.(*http.Transport).Proxy = http.ProxyFromEnvironment
 
-	if len(globalConfiguration.EntryPoints) == 0 {
-		globalConfiguration.EntryPoints = map[string]*configuration.EntryPoint{"http": {Address: ":80"}}
-		globalConfiguration.DefaultEntryPoints = []string{"http"}
+	staticConfiguration.SetEffectiveConfiguration()
+
+	// Warn only when no entryPoint disallows an encoded character:
+	// a single denial means the operator already knows about these options.
+	// Keep this after SetEffectiveConfiguration: it creates the default entryPoint,
+	// without which a bare configuration would never warn.
+	if staticConfiguration.HasTCPEntryPoint() && !staticConfiguration.HasDeniedEncodedCharacters() {
+		log.Warn().Msg("Traefik can reject some encoded characters in the request path. " +
+			"When your backend is not fully compliant with [RFC 3986](https://datatracker.ietf.org/doc/html/rfc3986), " +
+			"it is recommended to set these options to `false` to avoid split-view situation. " +
+			"Refer to the documentation for more details: https://doc.traefik.io/traefik/v3.8/migrate/v3/#encoded-characters-configuration-default-values")
 	}
 
-	if globalConfiguration.Rancher != nil {
-		// Ensure backwards compatibility for now
-		if len(globalConfiguration.Rancher.AccessKey) > 0 ||
-			len(globalConfiguration.Rancher.Endpoint) > 0 ||
-			len(globalConfiguration.Rancher.SecretKey) > 0 {
-
-			if globalConfiguration.Rancher.API == nil {
-				globalConfiguration.Rancher.API = &rancher.APIConfiguration{
-					AccessKey: globalConfiguration.Rancher.AccessKey,
-					SecretKey: globalConfiguration.Rancher.SecretKey,
-					Endpoint:  globalConfiguration.Rancher.Endpoint,
-				}
-			}
-			log.Warn("Deprecated configuration found: rancher.[accesskey|secretkey|endpoint]. " +
-				"Please use rancher.api.[accesskey|secretkey|endpoint] instead.")
-		}
-
-		if globalConfiguration.Rancher.Metadata != nil && len(globalConfiguration.Rancher.Metadata.Prefix) == 0 {
-			globalConfiguration.Rancher.Metadata.Prefix = "latest"
-		}
+	if err := staticConfiguration.ValidateConfiguration(); err != nil {
+		return err
 	}
 
-	if globalConfiguration.Debug {
-		globalConfiguration.LogLevel = "DEBUG"
-	}
+	log.Info().Str("version", version.Version).
+		Msgf("Traefik version %s built on %s", version.Version, version.BuildDate)
 
-	// logging
-	level, err := logrus.ParseLevel(strings.ToLower(globalConfiguration.LogLevel))
+	redactedStaticConfiguration, err := redactor.RemoveCredentials(staticConfiguration)
 	if err != nil {
-		log.Error("Error getting level", err)
-	}
-	log.SetLevel(level)
-	if len(globalConfiguration.TraefikLogsFile) > 0 {
-		dir := filepath.Dir(globalConfiguration.TraefikLogsFile)
-
-		err := os.MkdirAll(dir, 0755)
-		if err != nil {
-			log.Errorf("Failed to create log path %s: %s", dir, err)
-		}
-
-		err = log.OpenFile(globalConfiguration.TraefikLogsFile)
-		defer func() {
-			if err := log.CloseFile(); err != nil {
-				log.Error("Error closing log", err)
-			}
-		}()
-		if err != nil {
-			log.Error("Error opening file", err)
-		} else {
-			log.SetFormatter(&logrus.TextFormatter{DisableColors: true, FullTimestamp: true, DisableSorting: true})
-		}
+		log.Error().Err(err).Msg("Could not redact static configuration")
 	} else {
-		log.SetFormatter(&logrus.TextFormatter{FullTimestamp: true, DisableSorting: true})
-	}
-	jsonConf, _ := json.Marshal(globalConfiguration)
-	log.Infof("Traefik version %s built on %s", version.Version, version.BuildDate)
-
-	if globalConfiguration.CheckNewVersion {
-		ticker := time.NewTicker(24 * time.Hour)
-		safe.Go(func() {
-			version.CheckNewVersion()
-			for {
-				select {
-				case <-ticker.C:
-					version.CheckNewVersion()
-				}
-			}
-		})
+		log.Debug().RawJSON("staticConfiguration", []byte(redactedStaticConfiguration)).Msg("Static configuration loaded [json]")
 	}
 
-	log.Debugf("Global configuration loaded %s", string(jsonConf))
-	svr := server.NewServer(*globalConfiguration)
-	svr.Start()
+	checkNewVersion(staticConfiguration)
+
+	stats(staticConfiguration)
+
+	svr, err := setupServer(staticConfiguration)
+	if err != nil {
+		return err
+	}
+
+	if staticConfiguration.Ping != nil {
+		staticConfiguration.Ping.WithContext(ctx)
+	}
+
+	svr.Start(ctx)
 	defer svr.Close()
+
 	sent, err := daemon.SdNotify(false, "READY=1")
 	if !sent && err != nil {
-		log.Error("Fail to notify", err)
+		log.Error().Err(err).Msg("Failed to notify")
 	}
+
 	t, err := daemon.SdWatchdogEnabled(false)
 	if err != nil {
-		log.Error("Problem with watchdog", err)
+		log.Error().Err(err).Msg("Could not enable Watchdog")
 	} else if t != 0 {
 		// Send a ping each half time given
-		t = t / 2
-		log.Info("Watchdog activated with timer each ", t)
+		t /= 2
+		log.Info().Msgf("Watchdog activated with timer duration %s", t)
 		safe.Go(func() {
 			tick := time.Tick(t)
 			for range tick {
-				if ok, _ := daemon.SdNotify(false, "WATCHDOG=1"); !ok {
-					log.Error("Fail to tick watchdog")
+				resp, errHealthCheck := healthcheck.Do(*staticConfiguration)
+				if resp != nil {
+					_ = resp.Body.Close()
+				}
+
+				if staticConfiguration.Ping == nil || errHealthCheck == nil {
+					if ok, _ := daemon.SdNotify(false, "WATCHDOG=1"); !ok {
+						log.Error().Msg("Fail to tick watchdog")
+					}
+				} else {
+					log.Error().Err(errHealthCheck).Send()
 				}
 			}
 		})
 	}
+
 	svr.Wait()
-	log.Info("Shutting down")
+	log.Info().Msg("Shutting down")
+	return nil
 }
 
-// CreateKvSource creates KvSource
-// TLS support is enable for Consul and Etcd backends
-func CreateKvSource(traefikConfiguration *TraefikConfiguration) (*staert.KvSource, error) {
-	var kv *staert.KvSource
-	var kvStore store.Store
-	var err error
+func setupServer(staticConfiguration *static.Configuration) (*server.Server, error) {
+	providerAggregator := aggregator.NewProviderAggregator(*staticConfiguration.Providers)
 
-	switch {
-	case traefikConfiguration.Consul != nil:
-		kvStore, err = traefikConfiguration.Consul.CreateStore()
-		kv = &staert.KvSource{
-			Store:  kvStore,
-			Prefix: traefikConfiguration.Consul.Prefix,
-		}
-	case traefikConfiguration.Etcd != nil:
-		kvStore, err = traefikConfiguration.Etcd.CreateStore()
-		kv = &staert.KvSource{
-			Store:  kvStore,
-			Prefix: traefikConfiguration.Etcd.Prefix,
-		}
-	case traefikConfiguration.Zookeeper != nil:
-		kvStore, err = traefikConfiguration.Zookeeper.CreateStore()
-		kv = &staert.KvSource{
-			Store:  kvStore,
-			Prefix: traefikConfiguration.Zookeeper.Prefix,
-		}
-	case traefikConfiguration.Boltdb != nil:
-		kvStore, err = traefikConfiguration.Boltdb.CreateStore()
-		kv = &staert.KvSource{
-			Store:  kvStore,
-			Prefix: traefikConfiguration.Boltdb.Prefix,
+	ctx := context.Background()
+	routinesPool := safe.NewPool(ctx)
+
+	// adds internal provider
+	err := providerAggregator.AddProvider(traefik.New(*staticConfiguration))
+	if err != nil {
+		return nil, err
+	}
+
+	// ACME
+
+	tlsManager := traefiktls.NewManager(staticConfiguration.OCSP)
+	routinesPool.GoCtx(tlsManager.Run)
+
+	httpChallengeProvider := acme.NewChallengeHTTP()
+
+	tlsChallengeProvider := acme.NewChallengeTLSALPN()
+	err = providerAggregator.AddProvider(tlsChallengeProvider)
+	if err != nil {
+		return nil, err
+	}
+
+	acmeProviders := initACMEProvider(staticConfiguration, providerAggregator, tlsManager, httpChallengeProvider, tlsChallengeProvider, routinesPool)
+
+	// Tailscale
+
+	tsProviders := initTailscaleProviders(staticConfiguration, providerAggregator)
+
+	// Observability
+
+	metricRegistries := registerMetricClients(staticConfiguration.Metrics)
+	var semConvMetricRegistry *metrics.SemConvMetricsRegistry
+	if staticConfiguration.Metrics != nil && staticConfiguration.Metrics.OTLP != nil {
+		semConvMetricRegistry, err = metrics.NewSemConvMetricRegistry(ctx, staticConfiguration.Metrics.OTLP)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create SemConv metric registry: %w", err)
 		}
 	}
-	return kv, err
+	metricsRegistry := metrics.NewMultiRegistry(metricRegistries)
+	accessLog := setupAccessLog(ctx, staticConfiguration.AccessLog)
+	tracer, tracerCloser := setupTracing(ctx, staticConfiguration.Tracing)
+	observabilityMgr := middleware.NewObservabilityMgr(*staticConfiguration, metricsRegistry, semConvMetricRegistry, accessLog, tracer, tracerCloser)
+
+	// Entrypoints
+
+	serverEntryPointsTCP, err := server.NewTCPEntryPoints(staticConfiguration.EntryPoints, staticConfiguration.HostResolver, metricsRegistry)
+	if err != nil {
+		return nil, err
+	}
+
+	serverEntryPointsUDP, err := server.NewUDPEntryPoints(staticConfiguration.EntryPoints)
+	if err != nil {
+		return nil, err
+	}
+
+	if staticConfiguration.API != nil {
+		version.DisableDashboardAd = staticConfiguration.API.DisableDashboardAd
+		version.DashboardName = staticConfiguration.API.DashboardName
+	}
+
+	// Plugins
+	pluginLogger := log.Ctx(ctx).With().Logger()
+	hasPlugins := staticConfiguration.Experimental != nil && (staticConfiguration.Experimental.Plugins != nil || staticConfiguration.Experimental.LocalPlugins != nil)
+	if hasPlugins {
+		pluginsList := slices.Collect(maps.Keys(staticConfiguration.Experimental.Plugins))
+		pluginsList = append(pluginsList, slices.Collect(maps.Keys(staticConfiguration.Experimental.LocalPlugins))...)
+
+		pluginLogger = pluginLogger.With().Strs("plugins", pluginsList).Logger()
+		pluginLogger.Info().Msg("Loading plugins...")
+	}
+
+	pluginBuilder, err := createPluginBuilder(staticConfiguration)
+	if err != nil && staticConfiguration.Experimental != nil && staticConfiguration.Experimental.AbortOnPluginFailure {
+		return nil, fmt.Errorf("plugin: failed to create plugin builder: %w", err)
+	}
+	if err != nil {
+		pluginLogger.Err(err).Msg("Plugins are disabled because an error has occurred.")
+	} else if hasPlugins {
+		pluginLogger.Info().Msg("Plugins loaded.")
+	}
+
+	// Providers plugins
+
+	for name, conf := range staticConfiguration.Providers.Plugin {
+		if pluginBuilder == nil {
+			break
+		}
+
+		p, err := pluginBuilder.BuildProvider(name, conf)
+		if err != nil {
+			return nil, fmt.Errorf("plugin: failed to build provider: %w", err)
+		}
+
+		err = providerAggregator.AddProvider(p)
+		if err != nil {
+			return nil, fmt.Errorf("plugin: failed to add provider: %w", err)
+		}
+	}
+
+	// Service manager factory
+
+	var spiffeX509Source *workloadapi.X509Source
+	if staticConfiguration.Spiffe != nil && staticConfiguration.Spiffe.WorkloadAPIAddr != "" {
+		log.Info().Str("workloadAPIAddr", staticConfiguration.Spiffe.WorkloadAPIAddr).
+			Msg("Waiting on SPIFFE SVID delivery")
+
+		spiffeX509Source, err = workloadapi.NewX509Source(
+			ctx,
+			workloadapi.WithClientOptions(
+				workloadapi.WithAddr(
+					staticConfiguration.Spiffe.WorkloadAPIAddr,
+				),
+			),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create SPIFFE x509 source: %w", err)
+		}
+		log.Info().Msg("Successfully obtained SPIFFE SVID.")
+	}
+
+	transportManager := service.NewTransportManager(spiffeX509Source)
+
+	var proxyBuilder service.ProxyBuilder = httputil.NewProxyBuilder(transportManager, semConvMetricRegistry)
+	if staticConfiguration.Experimental != nil && staticConfiguration.Experimental.FastProxy != nil {
+		proxyBuilder = proxy.NewSmartBuilder(transportManager, proxyBuilder, *staticConfiguration.Experimental.FastProxy)
+	}
+
+	dialerManager := tcp.NewDialerManager(spiffeX509Source)
+	acmeHTTPHandler := getHTTPChallengeHandler(acmeProviders, httpChallengeProvider)
+	managerFactory := service.NewManagerFactory(*staticConfiguration, routinesPool, observabilityMgr, transportManager, proxyBuilder, acmeHTTPHandler, tlsManager)
+
+	// Router factory
+
+	routerFactory, err := server.NewRouterFactory(*staticConfiguration, managerFactory, tlsManager, observabilityMgr, pluginBuilder, dialerManager)
+	if err != nil {
+		return nil, fmt.Errorf("creating router factory: %w", err)
+	}
+
+	// Watcher
+
+	watcher := server.NewConfigurationWatcher(
+		routinesPool,
+		providerAggregator,
+		getDefaultsEntrypoints(staticConfiguration),
+		"internal",
+		staticConfiguration.Core != nil && staticConfiguration.Core.StrictTLSOptions,
+	)
+
+	// TLS
+	watcher.AddListener(func(conf dynamic.Configuration) {
+		ctx := context.Background()
+		tlsManager.UpdateConfigs(ctx, conf.TLS.Stores, conf.TLS.Options, conf.TLS.Certificates)
+
+		gauge := metricsRegistry.TLSCertsNotAfterTimestampGauge()
+		for _, certificate := range tlsManager.GetServerCertificates() {
+			appendCertMetric(gauge, certificate)
+		}
+	})
+
+	// Metrics
+	watcher.AddListener(func(_ dynamic.Configuration) {
+		metricsRegistry.ConfigReloadsCounter().Add(1)
+		metricsRegistry.LastConfigReloadSuccessGauge().Set(float64(time.Now().Unix()))
+	})
+
+	// Server Transports
+	watcher.AddListener(func(conf dynamic.Configuration) {
+		transportManager.Update(conf.HTTP.ServersTransports)
+		proxyBuilder.Update(conf.HTTP.ServersTransports)
+		dialerManager.Update(conf.TCP.ServersTransports)
+	})
+
+	// Switch router
+	watcher.AddListener(switchRouter(routerFactory, serverEntryPointsTCP, serverEntryPointsUDP))
+
+	// Metrics
+	if metricsRegistry.IsEpEnabled() || metricsRegistry.IsRouterEnabled() || metricsRegistry.IsSvcEnabled() {
+		var eps []string
+		for key := range serverEntryPointsTCP {
+			eps = append(eps, key)
+		}
+		watcher.AddListener(func(conf dynamic.Configuration) {
+			metrics.OnConfigurationUpdate(conf, eps)
+		})
+	}
+
+	// TLS challenge
+	watcher.AddListener(tlsChallengeProvider.ListenConfiguration)
+
+	// Certificate Resolvers
+
+	resolverNames := map[string]struct{}{}
+
+	// ACME
+	for _, p := range acmeProviders {
+		resolverNames[p.ResolverName] = struct{}{}
+		watcher.AddListener(p.ListenConfiguration)
+	}
+
+	// Tailscale
+	for _, p := range tsProviders {
+		resolverNames[p.ResolverName] = struct{}{}
+		watcher.AddListener(p.HandleConfigUpdate)
+	}
+
+	// Certificate resolver logs
+	watcher.AddListener(func(config dynamic.Configuration) {
+		for rtName, rt := range config.HTTP.Routers {
+			if rt.TLS == nil || rt.TLS.CertResolver == "" {
+				continue
+			}
+
+			if _, ok := resolverNames[rt.TLS.CertResolver]; !ok {
+				log.Error().Str(logs.RouterName, rtName).Str("certificateResolver", rt.TLS.CertResolver).
+					Msg("Router uses a nonexistent certificate resolver")
+			}
+		}
+	})
+
+	return server.NewServer(routinesPool, serverEntryPointsTCP, serverEntryPointsUDP, watcher, observabilityMgr), nil
+}
+
+func getHTTPChallengeHandler(acmeProviders []*acme.Provider, httpChallengeProvider http.Handler) http.Handler {
+	var acmeHTTPHandler http.Handler
+	for _, p := range acmeProviders {
+		if p != nil && p.HTTPChallenge != nil {
+			acmeHTTPHandler = httpChallengeProvider
+			break
+		}
+	}
+	return acmeHTTPHandler
+}
+
+func getDefaultsEntrypoints(staticConfiguration *static.Configuration) []string {
+	var defaultEntryPoints []string
+
+	// Determines if at least one EntryPoint is configured to be used by default.
+	var hasDefinedDefaults bool
+	for _, ep := range staticConfiguration.EntryPoints {
+		if ep.AsDefault {
+			hasDefinedDefaults = true
+			break
+		}
+	}
+
+	for name, cfg := range staticConfiguration.EntryPoints {
+		// By default all entrypoints are considered.
+		// If at least one is flagged, then only flagged entrypoints are included.
+		if hasDefinedDefaults && !cfg.AsDefault {
+			continue
+		}
+
+		protocol, err := cfg.GetProtocol()
+		if err != nil {
+			// Should never happen because Traefik should not start if protocol is invalid.
+			log.Error().Err(err).Msg("Invalid protocol")
+		}
+
+		if protocol != "udp" && name != static.DefaultInternalEntryPointName {
+			defaultEntryPoints = append(defaultEntryPoints, name)
+		}
+	}
+
+	slices.Sort(defaultEntryPoints)
+	return defaultEntryPoints
+}
+
+func switchRouter(routerFactory *server.RouterFactory, serverEntryPointsTCP server.TCPEntryPoints, serverEntryPointsUDP server.UDPEntryPoints) func(conf dynamic.Configuration) {
+	return func(conf dynamic.Configuration) {
+		rtConf := runtime.NewConfig(conf)
+
+		routers, udpRouters := routerFactory.CreateRouters(rtConf)
+
+		serverEntryPointsTCP.Switch(routers)
+		serverEntryPointsUDP.Switch(udpRouters)
+	}
+}
+
+// initACMEProvider creates and registers acme.Provider instances corresponding to the configured ACME certificate resolvers.
+func initACMEProvider(c *static.Configuration, providerAggregator *aggregator.ProviderAggregator, tlsManager *traefiktls.Manager, httpChallengeProvider, tlsChallengeProvider challenge.Provider, routinesPool *safe.Pool) []*acme.Provider {
+	localStores := map[string]*acme.LocalStore{}
+
+	var resolvers []*acme.Provider
+	for name, resolver := range c.CertificatesResolvers {
+		if resolver.ACME == nil {
+			continue
+		}
+
+		if localStores[resolver.ACME.Storage] == nil {
+			localStores[resolver.ACME.Storage] = acme.NewLocalStore(resolver.ACME.Storage, routinesPool)
+		}
+
+		p := &acme.Provider{
+			Configuration:         resolver.ACME,
+			Store:                 localStores[resolver.ACME.Storage],
+			ResolverName:          name,
+			HTTPChallengeProvider: httpChallengeProvider,
+			TLSChallengeProvider:  tlsChallengeProvider,
+		}
+
+		if err := providerAggregator.AddProvider(p); err != nil {
+			log.Error().Err(err).Str("resolver", name).Msg("The ACME resolve is skipped from the resolvers list")
+			continue
+		}
+
+		p.SetTLSManager(tlsManager)
+
+		p.SetConfigListenerChan(make(chan dynamic.Configuration))
+
+		resolvers = append(resolvers, p)
+	}
+
+	return resolvers
+}
+
+// initTailscaleProviders creates and registers tailscale.Provider instances corresponding to the configured Tailscale certificate resolvers.
+func initTailscaleProviders(cfg *static.Configuration, providerAggregator *aggregator.ProviderAggregator) []*tailscale.Provider {
+	var providers []*tailscale.Provider
+	for name, resolver := range cfg.CertificatesResolvers {
+		if resolver.Tailscale == nil {
+			continue
+		}
+
+		tsProvider := &tailscale.Provider{ResolverName: name}
+
+		if err := providerAggregator.AddProvider(tsProvider); err != nil {
+			log.Error().Err(err).Str(logs.ProviderName, name).Msg("Unable to create Tailscale provider")
+			continue
+		}
+
+		providers = append(providers, tsProvider)
+	}
+
+	return providers
+}
+
+func registerMetricClients(metricsConfig *otypes.Metrics) []metrics.Registry {
+	if metricsConfig == nil {
+		return nil
+	}
+
+	var registries []metrics.Registry
+
+	if metricsConfig.Prometheus != nil {
+		logger := log.With().Str(logs.MetricsProviderName, "prometheus").Logger()
+
+		prometheusRegister := metrics.RegisterPrometheus(logger.WithContext(context.Background()), metricsConfig.Prometheus)
+		if prometheusRegister != nil {
+			registries = append(registries, prometheusRegister)
+			logger.Debug().Msg("Configured Prometheus metrics")
+		}
+	}
+
+	if metricsConfig.Datadog != nil {
+		logger := log.With().Str(logs.MetricsProviderName, "datadog").Logger()
+
+		registries = append(registries, metrics.RegisterDatadog(logger.WithContext(context.Background()), metricsConfig.Datadog))
+		logger.Debug().
+			Str("address", metricsConfig.Datadog.Address).
+			Str("pushInterval", metricsConfig.Datadog.PushInterval.String()).
+			Msgf("Configured Datadog metrics")
+	}
+
+	if metricsConfig.StatsD != nil {
+		logger := log.With().Str(logs.MetricsProviderName, "statsd").Logger()
+
+		registries = append(registries, metrics.RegisterStatsd(logger.WithContext(context.Background()), metricsConfig.StatsD))
+		logger.Debug().
+			Str("address", metricsConfig.StatsD.Address).
+			Str("pushInterval", metricsConfig.StatsD.PushInterval.String()).
+			Msg("Configured StatsD metrics")
+	}
+
+	if metricsConfig.InfluxDB2 != nil {
+		logger := log.With().Str(logs.MetricsProviderName, "influxdb2").Logger()
+
+		influxDB2Register := metrics.RegisterInfluxDB2(logger.WithContext(context.Background()), metricsConfig.InfluxDB2)
+		if influxDB2Register != nil {
+			registries = append(registries, influxDB2Register)
+			logger.Debug().
+				Str("address", metricsConfig.InfluxDB2.Address).
+				Str("bucket", metricsConfig.InfluxDB2.Bucket).
+				Str("organization", metricsConfig.InfluxDB2.Org).
+				Str("pushInterval", metricsConfig.InfluxDB2.PushInterval.String()).
+				Msg("Configured InfluxDB v2 metrics")
+		}
+	}
+
+	if metricsConfig.OTLP != nil {
+		logger := log.With().Str(logs.MetricsProviderName, "openTelemetry").Logger()
+
+		openTelemetryRegistry := metrics.RegisterOpenTelemetry(logger.WithContext(context.Background()), metricsConfig.OTLP)
+		if openTelemetryRegistry != nil {
+			registries = append(registries, openTelemetryRegistry)
+			logger.Debug().
+				Str("pushInterval", metricsConfig.OTLP.PushInterval.String()).
+				Msg("Configured OpenTelemetry metrics")
+		}
+	}
+
+	return registries
+}
+
+func appendCertMetric(gauge gokitmetrics.Gauge, certificate *x509.Certificate) {
+	slices.Sort(certificate.DNSNames)
+
+	labels := []string{
+		"cn", certificate.Subject.CommonName,
+		"serial", certificate.SerialNumber.String(),
+		"sans", strings.Join(certificate.DNSNames, ","),
+	}
+
+	notAfter := float64(certificate.NotAfter.Unix())
+
+	gauge.With(labels...).Set(notAfter)
+}
+
+func setupAccessLog(ctx context.Context, conf *otypes.AccessLog) *accesslog.Handler {
+	if conf == nil {
+		return nil
+	}
+
+	accessLoggerMiddleware, err := accesslog.NewHandler(ctx, conf)
+	if err != nil {
+		log.Warn().Err(err).Msg("Unable to create access logger")
+		return nil
+	}
+
+	return accessLoggerMiddleware
+}
+
+func setupTracing(ctx context.Context, conf *static.Tracing) (*tracing.Tracer, io.Closer) {
+	if conf == nil {
+		return nil, nil
+	}
+
+	tracer, closer, err := tracing.NewTracing(ctx, conf)
+	if err != nil {
+		log.Warn().Err(err).Msg("Unable to create tracer")
+		return nil, nil
+	}
+
+	return tracer, closer
+}
+
+func checkNewVersion(staticConfiguration *static.Configuration) {
+	logger := log.With().Logger()
+
+	if staticConfiguration.Global.CheckNewVersion {
+		logger.Info().Msg(`Version check is enabled.`)
+		logger.Info().Msg(`Traefik checks for new releases to notify you if your version is out of date.`)
+		logger.Info().Msg(`It also collects usage data during this process.`)
+		logger.Info().Msg(`Check the documentation to get more info: https://doc.traefik.io/traefik/contributing/data-collection/`)
+
+		ticker := time.Tick(24 * time.Hour)
+		safe.Go(func() {
+			for time.Sleep(10 * time.Minute); ; <-ticker {
+				version.CheckNewVersion()
+			}
+		})
+	} else {
+		logger.Info().Msg(`
+Version check is disabled.
+You will not be notified if a new version is available.
+More details: https://doc.traefik.io/traefik/contributing/data-collection/
+`)
+	}
+}
+
+func stats(staticConfiguration *static.Configuration) {
+	logger := log.With().Logger()
+
+	if staticConfiguration.Global.SendAnonymousUsage {
+		logger.Info().Msg(`Stats collection is enabled.`)
+		logger.Info().Msg(`Many thanks for contributing to Traefik's improvement by allowing us to receive anonymous information from your configuration.`)
+		logger.Info().Msg(`Help us improve Traefik by leaving this feature on :)`)
+		logger.Info().Msg(`More details on: https://doc.traefik.io/traefik/contributing/data-collection/`)
+		collect(staticConfiguration)
+	} else {
+		logger.Info().Msg(`
+Stats collection is disabled.
+Help us improve Traefik by turning this feature on :)
+More details on: https://doc.traefik.io/traefik/contributing/data-collection/
+`)
+	}
+}
+
+func collect(staticConfiguration *static.Configuration) {
+	ticker := time.Tick(24 * time.Hour)
+	safe.Go(func() {
+		for time.Sleep(10 * time.Minute); ; <-ticker {
+			if err := collector.Collect(staticConfiguration); err != nil {
+				log.Debug().Err(err).Send()
+			}
+		}
+	})
 }

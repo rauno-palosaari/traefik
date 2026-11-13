@@ -1,177 +1,255 @@
 package integration
 
 import (
-	"encoding/json"
-	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
-	"os"
-	"strings"
+	"testing"
 	"time"
 
-	"github.com/containous/traefik/integration/try"
-	"github.com/containous/traefik/types"
-	"github.com/docker/docker/pkg/namesgenerator"
-	"github.com/go-check/check"
-	d "github.com/libkermit/docker"
-	docker "github.com/libkermit/docker-check"
-	checker "github.com/vdemeester/shakers"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+	"github.com/traefik/traefik/v3/integration/try"
 )
 
-var (
-	// Label added to started container to identify them as part of the integration test
-	TestLabel = "io.traefik.test"
-
-	// Images to have or pull before the build in order to make it work
-	// FIXME handle this offline but loading them before build
-	RequiredImages = map[string]string{
-		"swarm": "1.0.0",
-		"nginx": "1",
-	}
-)
-
-// Docker test suites
+// Docker tests suite.
 type DockerSuite struct {
 	BaseSuite
-	project *docker.Project
 }
 
-func (s *DockerSuite) startContainer(c *check.C, image string, args ...string) string {
-	return s.startContainerWithConfig(c, image, d.ContainerConfig{
-		Cmd: args,
-	})
+func TestDockerSuite(t *testing.T) {
+	suite.Run(t, new(DockerSuite))
 }
 
-func (s *DockerSuite) startContainerWithLabels(c *check.C, image string, labels map[string]string, args ...string) string {
-	return s.startContainerWithConfig(c, image, d.ContainerConfig{
-		Cmd:    args,
-		Labels: labels,
-	})
+func (s *DockerSuite) SetupSuite() {
+	s.BaseSuite.SetupSuite()
+	s.createComposeProject("docker")
 }
 
-func (s *DockerSuite) startContainerWithConfig(c *check.C, image string, config d.ContainerConfig) string {
-	if config.Name == "" {
-		config.Name = namesgenerator.GetRandomName(10)
+func (s *DockerSuite) TearDownSuite() {
+	s.BaseSuite.TearDownSuite()
+}
+
+func (s *DockerSuite) TearDownTest() {
+	s.composeStop("simple", "withtcplabels", "withlabels1", "withlabels2", "withonelabelmissing", "powpow", "nonRunning")
+}
+
+func (s *DockerSuite) TestSimpleConfiguration() {
+	tempObjects := struct {
+		DockerHost  string
+		DefaultRule string
+	}{
+		DockerHost:  s.getDockerHost(),
+		DefaultRule: "Host(`{{ normalize .Name }}.docker.localhost`)",
 	}
 
-	container := s.project.StartWithConfig(c, image, config)
+	file := s.adaptFile("fixtures/docker/simple.toml", tempObjects)
 
-	// FIXME(vdemeester) this is ugly (it's because of the / in front of the name in docker..)
-	return strings.SplitAfter(container.Name, "/")[1]
+	s.composeUp()
+
+	s.traefikCmd(withConfigFile(file))
+
+	// Expected a 404 as we did not configure anything
+	err := try.GetRequest("http://127.0.0.1:8000/", 500*time.Millisecond, try.StatusCodeIs(http.StatusNotFound))
+	require.NoError(s.T(), err)
 }
 
-func (s *DockerSuite) SetUpSuite(c *check.C) {
-	project := docker.NewProjectFromEnv(c)
-	s.project = project
-
-	// Pull required images
-	for repository, tag := range RequiredImages {
-		image := fmt.Sprintf("%s:%s", repository, tag)
-		s.project.Pull(c, image)
+func (s *DockerSuite) TestDefaultDockerContainers() {
+	tempObjects := struct {
+		DockerHost  string
+		DefaultRule string
+	}{
+		DockerHost:  s.getDockerHost(),
+		DefaultRule: "Host(`{{ normalize .Name }}.docker.localhost`)",
 	}
-}
 
-func (s *DockerSuite) TearDownTest(c *check.C) {
-	s.project.Clean(c, os.Getenv("CIRCLECI") != "")
-}
+	file := s.adaptFile("fixtures/docker/simple.toml", tempObjects)
 
-func (s *DockerSuite) TestSimpleConfiguration(c *check.C) {
-	file := s.adaptFileForHost(c, "fixtures/docker/simple.toml")
-	defer os.Remove(file)
-
-	cmd, _ := s.cmdTraefik(withConfigFile(file))
-	err := cmd.Start()
-	c.Assert(err, checker.IsNil)
-	defer cmd.Process.Kill()
-
-	// TODO validate : run on 80
-	// Expected a 404 as we did not comfigure anything
-	err = try.GetRequest("http://127.0.0.1:8000/", 500*time.Millisecond, try.StatusCodeIs(404))
-	c.Assert(err, checker.IsNil)
-}
-
-func (s *DockerSuite) TestDefaultDockerContainers(c *check.C) {
-	file := s.adaptFileForHost(c, "fixtures/docker/simple.toml")
-	defer os.Remove(file)
-	name := s.startContainer(c, "swarm:1.0.0", "manage", "token://blablabla")
+	s.composeUp("simple")
 
 	// Start traefik
-	cmd, _ := s.cmdTraefik(withConfigFile(file))
-	err := cmd.Start()
-	c.Assert(err, checker.IsNil)
-	defer cmd.Process.Kill()
+	s.traefikCmd(withConfigFile(file))
 
 	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/version", nil)
-	c.Assert(err, checker.IsNil)
-	req.Host = fmt.Sprintf("%s.docker.localhost", strings.Replace(name, "_", "-", -1))
+	require.NoError(s.T(), err)
+	req.Host = "simple.docker.localhost"
 
-	// FIXME Need to wait than 500 milliseconds more (for swarm or traefik to boot up ?)
-	resp, err := try.ResponseUntilStatusCode(req, 1500*time.Millisecond, 200)
-	c.Assert(err, checker.IsNil)
-
-	body, err := ioutil.ReadAll(resp.Body)
-	c.Assert(err, checker.IsNil)
-
-	var version map[string]interface{}
-
-	c.Assert(json.Unmarshal(body, &version), checker.IsNil)
-	c.Assert(version["Version"], checker.Equals, "swarm/1.0.0")
+	_, err = try.ResponseUntilStatusCode(req, 3*time.Second, http.StatusOK)
+	require.NoError(s.T(), err)
 }
 
-func (s *DockerSuite) TestDockerContainersWithLabels(c *check.C) {
-	file := s.adaptFileForHost(c, "fixtures/docker/simple.toml")
-	defer os.Remove(file)
-	// Start a container with some labels
-	labels := map[string]string{
-		types.LabelFrontendRule: "Host:my.super.host",
+func (s *DockerSuite) TestDockerContainersWithTCPLabels() {
+	tempObjects := struct {
+		DockerHost  string
+		DefaultRule string
+	}{
+		DockerHost:  s.getDockerHost(),
+		DefaultRule: "Host(`{{ normalize .Name }}.docker.localhost`)",
 	}
-	s.startContainerWithLabels(c, "swarm:1.0.0", labels, "manage", "token://blabla")
+
+	file := s.adaptFile("fixtures/docker/simple.toml", tempObjects)
+
+	s.composeUp("withtcplabels")
 
 	// Start traefik
-	cmd, _ := s.cmdTraefik(withConfigFile(file))
-	err := cmd.Start()
-	c.Assert(err, checker.IsNil)
-	defer cmd.Process.Kill()
+	s.traefikCmd(withConfigFile(file))
+
+	err := try.GetRequest("http://127.0.0.1:8080/api/rawdata", 500*time.Millisecond, try.StatusCodeIs(http.StatusOK), try.BodyContains("HostSNI(`my.super.host`)"))
+	require.NoError(s.T(), err)
+
+	who, err := guessWho("127.0.0.1:8000", "my.super.host", true)
+	require.NoError(s.T(), err)
+
+	assert.Contains(s.T(), who, "my.super.host")
+}
+
+func (s *DockerSuite) TestDockerContainersWithLabels() {
+	tempObjects := struct {
+		DockerHost  string
+		DefaultRule string
+	}{
+		DockerHost:  s.getDockerHost(),
+		DefaultRule: "Host(`{{ normalize .Name }}.docker.localhost`)",
+	}
+
+	file := s.adaptFile("fixtures/docker/simple.toml", tempObjects)
+
+	s.composeUp("withlabels1", "withlabels2")
+
+	// Start traefik
+	s.traefikCmd(withConfigFile(file))
 
 	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/version", nil)
-	c.Assert(err, checker.IsNil)
+	require.NoError(s.T(), err)
+	req.Host = "my-super.host"
+
+	_, err = try.ResponseUntilStatusCode(req, 3*time.Second, http.StatusOK)
+	require.NoError(s.T(), err)
+
+	req, err = http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/version", nil)
+	require.NoError(s.T(), err)
 	req.Host = "my.super.host"
 
-	// FIXME Need to wait than 500 milliseconds more (for swarm or traefik to boot up ?)
-	resp, err := try.ResponseUntilStatusCode(req, 1500*time.Millisecond, http.StatusOK)
-	c.Assert(err, checker.IsNil)
-
-	body, err := ioutil.ReadAll(resp.Body)
-	c.Assert(err, checker.IsNil)
-
-	var version map[string]interface{}
-
-	c.Assert(json.Unmarshal(body, &version), checker.IsNil)
-	c.Assert(version["Version"], checker.Equals, "swarm/1.0.0")
+	_, err = try.ResponseUntilStatusCode(req, 3*time.Second, http.StatusOK)
+	require.NoError(s.T(), err)
 }
 
-func (s *DockerSuite) TestDockerContainersWithOneMissingLabels(c *check.C) {
-	file := s.adaptFileForHost(c, "fixtures/docker/simple.toml")
-	defer os.Remove(file)
-	// Start a container with some labels
-	labels := map[string]string{
-		types.LabelTraefikFrontendValue: "my.super.host",
+func (s *DockerSuite) TestDockerContainersWithOneMissingLabels() {
+	tempObjects := struct {
+		DockerHost  string
+		DefaultRule string
+	}{
+		DockerHost:  s.getDockerHost(),
+		DefaultRule: "Host(`{{ normalize .Name }}.docker.localhost`)",
 	}
-	s.startContainerWithLabels(c, "swarm:1.0.0", labels, "manage", "token://blabla")
+
+	file := s.adaptFile("fixtures/docker/simple.toml", tempObjects)
+
+	s.composeUp("withonelabelmissing")
 
 	// Start traefik
-	cmd, _ := s.cmdTraefik(withConfigFile(file))
-	err := cmd.Start()
-	c.Assert(err, checker.IsNil)
-	defer cmd.Process.Kill()
+	s.traefikCmd(withConfigFile(file))
 
 	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/version", nil)
-	c.Assert(err, checker.IsNil)
+	require.NoError(s.T(), err)
 	req.Host = "my.super.host"
 
-	// FIXME Need to wait than 500 milliseconds more (for swarm or traefik to boot up ?)
-	// TODO validate : run on 80
-	// Expected a 404 as we did not comfigure anything
-	err = try.Request(req, 1500*time.Millisecond, try.StatusCodeIs(http.StatusNotFound))
-	c.Assert(err, checker.IsNil)
+	// Expected a 404 as we did not configure anything
+	err = try.Request(req, 3*time.Second, try.StatusCodeIs(http.StatusNotFound))
+	require.NoError(s.T(), err)
+}
+
+func (s *DockerSuite) TestRestartDockerContainers() {
+	tempObjects := struct {
+		DockerHost  string
+		DefaultRule string
+	}{
+		DockerHost:  s.getDockerHost(),
+		DefaultRule: "Host(`{{ normalize .Name }}.docker.localhost`)",
+	}
+
+	file := s.adaptFile("fixtures/docker/simple.toml", tempObjects)
+
+	s.composeUp("powpow")
+
+	// Start traefik
+	s.traefikCmd(withConfigFile(file))
+
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/version", nil)
+	require.NoError(s.T(), err)
+	req.Host = "my.super.host"
+
+	// TODO Need to wait than 500 milliseconds more (for swarm or traefik to boot up ?)
+	_, err = try.ResponseUntilStatusCode(req, 1500*time.Millisecond, http.StatusOK)
+	require.NoError(s.T(), err)
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 60*time.Second, try.BodyContains("powpow"))
+	require.NoError(s.T(), err)
+
+	s.composeStop("powpow")
+
+	time.Sleep(5 * time.Second)
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 10*time.Second, try.BodyContains("powpow"))
+	assert.Error(s.T(), err)
+
+	s.composeUp("powpow")
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 60*time.Second, try.BodyContains("powpow"))
+	require.NoError(s.T(), err)
+}
+
+func (s *DockerSuite) TestDockerAllowNonRunning() {
+	tempObjects := struct {
+		DockerHost  string
+		DefaultRule string
+	}{
+		DockerHost:  s.getDockerHost(),
+		DefaultRule: "Host(`{{ normalize .Name }}.docker.localhost`)",
+	}
+
+	file := s.adaptFile("fixtures/docker/simple.toml", tempObjects)
+
+	s.composeUp("nonRunning")
+
+	// Start traefik
+	s.traefikCmd(withConfigFile(file))
+
+	// Verify the container is working when running
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/", nil)
+	require.NoError(s.T(), err)
+	req.Host = "non.running.host"
+
+	resp, err := try.ResponseUntilStatusCode(req, 3*time.Second, http.StatusOK)
+	require.NoError(s.T(), err)
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(s.T(), err)
+	assert.Contains(s.T(), string(body), "Hostname:")
+
+	// Verify the router exists in Traefik configuration
+	err = try.GetRequest("http://127.0.0.1:8080/api/http/routers", 1*time.Second, try.BodyContains("NonRunning"))
+	require.NoError(s.T(), err)
+
+	// Stop the container
+	s.composeStop("nonRunning")
+
+	// Wait a bit for container stop to be detected
+	time.Sleep(2 * time.Second)
+
+	// Verify the router still exists in configuration even though container is stopped
+	// This is the key test - the router should persist due to allowNonRunning=true
+	err = try.GetRequest("http://127.0.0.1:8080/api/http/routers", 10*time.Second, try.BodyContains("NonRunning"))
+	require.NoError(s.T(), err)
+
+	// Verify the service still exists in configuration
+	err = try.GetRequest("http://127.0.0.1:8080/api/http/services", 1*time.Second, try.BodyContains("nonRunning"))
+	require.NoError(s.T(), err)
+
+	// HTTP requests should fail (502 Bad Gateway) since container is stopped but router exists
+	req, err = http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/", nil)
+	require.NoError(s.T(), err)
+	req.Host = "non.running.host"
+
+	err = try.Request(req, 3*time.Second, try.StatusCodeIs(http.StatusServiceUnavailable))
+	require.NoError(s.T(), err)
 }
